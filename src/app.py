@@ -5,19 +5,77 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
+import json
+import jwt
+from datetime import datetime, timedelta
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
+# JWT Configuration
+SECRET_KEY = "mergington_high_school_secret_key_2025"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
+
+# Security scheme
+security = HTTPBearer(auto_error=False)
+
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Load teacher credentials
+def load_teachers():
+    try:
+        with open(current_dir / "teachers.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"teachers": {}}
+
+teachers_data = load_teachers()
+
+# Authentication helper functions
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+        return username
+    except jwt.PyJWTError:
+        return None
+
+def get_current_teacher(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    username = verify_token(credentials)
+    if not username or username not in teachers_data["teachers"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return username
+
+def get_optional_teacher(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Optional authentication - returns None if not authenticated"""
+    if not credentials:
+        return None
+    return verify_token(credentials)
 
 # In-memory activity database
 activities = {
@@ -88,9 +146,43 @@ def get_activities():
     return activities
 
 
+# Authentication endpoints
+@app.post("/auth/login")
+def login(username: str, password: str):
+    """Login for teachers"""
+    if username not in teachers_data["teachers"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password"
+        )
+    
+    teacher = teachers_data["teachers"][username]
+    if teacher["password"] != password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password"
+        )
+    
+    access_token = create_access_token(data={"sub": username})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "teacher_name": teacher["name"]
+    }
+
+@app.get("/auth/me")
+def get_current_user(current_teacher: str = Depends(get_current_teacher)):
+    """Get current logged in teacher info"""
+    teacher = teachers_data["teachers"][current_teacher]
+    return {
+        "username": current_teacher,
+        "name": teacher["name"]
+    }
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(activity_name: str, email: str, current_teacher: str = Depends(get_current_teacher)):
+    """Sign up a student for an activity (teachers only)"""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +203,8 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(activity_name: str, email: str, current_teacher: str = Depends(get_current_teacher)):
+    """Unregister a student from an activity (teachers only)"""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
